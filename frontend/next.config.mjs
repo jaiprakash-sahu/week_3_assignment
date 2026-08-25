@@ -1,8 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   async rewrites() {
-    // Use environment variable for API URL, fallback to localhost for development
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8082';
+    // Use environment variable for API URL, fallback to your active Cloudflare tunnel URL for production
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://modes-widespread-informative-shaped.trycloudflare.com';
     
     return [
       {
@@ -22,4 +22,3 @@ const nextConfig = {
 };
 
 export default nextConfig;
-
