@@ -2,11 +2,10 @@
 """
 FastAPI Server for SIGGRAPH 2025 RAG Pipeline.
 
-Provides REST API for the RAG pipeline.
-Frontend is served from the /frontend folder.
+Provides REST, SSE streaming, and WebSocket APIs for the RAG pipeline.
 
 Requirements:
-    pip install fastapi uvicorn
+    pip install fastapi uvicorn requests
 
 Usage:
     python api_server.py
@@ -15,17 +14,16 @@ Usage:
 import asyncio
 import time
 import os
+import json
+import requests
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from contextlib import asynccontextmanager
 
-from typing import AsyncGenerator
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import json
 
 try:
     from dotenv import load_dotenv
@@ -33,15 +31,14 @@ try:
 except ImportError:
     pass
 
-from test_backend_integration import RAGGenerator, GenerationConfig, SYSTEM_PROMPT
+from rag_generate import RAGGenerator, GenerationConfig, SYSTEM_PROMPT
 
 
-# Global instances
+# Global instance
 rag_generator: Optional[RAGGenerator] = None
 
 # Paths
 BASE_DIR = Path(__file__).parent
-
 
 
 @asynccontextmanager
@@ -49,20 +46,18 @@ async def lifespan(app: FastAPI):
     """Initialize RAG pipeline on startup."""
     global rag_generator
     
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("🚀 Initializing RAG pipeline...")
-    print("="*60)
+    print("=" * 60)
     
     config = GenerationConfig(
-        llm_provider="openai",
         retrieval_top_k=8,
-        refine_query=True,
-        use_reranker=True
+        refine_query=True
     )
     
-    rag_generator = RAGGenerator(config)
+    rag_generator = RAGGenerator(config=config)
     print("\n✅ RAG pipeline ready!")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
     
     yield
     
@@ -106,7 +101,7 @@ class QueryResponse(BaseModel):
 # API Endpoints
 @app.get("/health")
 async def health():
-    """Health check."""
+    """Health check endpoint."""
     return {
         "status": "healthy",
         "rag_initialized": rag_generator is not None,
@@ -116,14 +111,15 @@ async def health():
 
 @app.get("/api/info")
 async def api_info():
-    """API information."""
+    """API metadata and routes."""
     return {
         "service": "SIGGRAPH 2025 RAG API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /": "Frontend UI",
             "GET /health": "Health check",
-            "POST /api/query": "Query endpoint"
+            "POST /api/query": "Synchronous query endpoint",
+            "GET /api/stream": "Server-Sent Events (SSE) streaming endpoint",
+            "WS /ws/query": "WebSocket streaming endpoint"
         }
     }
 
@@ -131,8 +127,8 @@ async def api_info():
 @app.post("/api/query", response_model=QueryResponse)
 async def query_endpoint(request: QueryRequest):
     """
-    Query the RAG pipeline.
-    Returns answer with citations and sources.
+    Query the RAG pipeline synchronously.
+    Returns complete answer with citations and sources.
     """
     if not rag_generator:
         raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
@@ -140,7 +136,6 @@ async def query_endpoint(request: QueryRequest):
     start_time = time.time()
     
     try:
-        # Run in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
@@ -176,7 +171,6 @@ async def stream_rag_response(
     Uses Server-Sent Events (SSE) format.
     """
     def emit(event_type: str, data: dict) -> str:
-        """Format SSE event."""
         return f"data: {json.dumps({'type': event_type, **data})}\n\n"
     
     start_time = time.time()
@@ -202,7 +196,8 @@ async def stream_rag_response(
                 })
         
         # Stage 2: Searching
-        yield emit("progress", {"message": "Searching 11,008 paper chunks...", "stage": "searching"})
+        total_chunks = len(rag_generator.retrieval.chunks)
+        yield emit("progress", {"message": f"Searching {total_chunks:,} paper chunks...", "stage": "searching"})
         
         results = await loop.run_in_executor(
             None,
@@ -224,11 +219,9 @@ async def stream_rag_response(
         # Stage 3: Generating
         yield emit("progress", {"message": "Generating answer...", "stage": "generating"})
         
-        # Format context and build sources
         context = rag_generator._format_context(results)
         sources_metadata = rag_generator._build_sources_metadata(results)
         
-        # Build prompt
         user_message = f"""Based on the following research paper excerpts, answer this question:
 
 Question: {query}
@@ -242,16 +235,15 @@ IMPORTANT: You have been provided with {len(results)} paper excerpts. Make sure 
 3. For "which paper" or "what papers" questions, list ALL relevant papers
 4. Do NOT include a References section - only use inline citations"""
 
-        # Stream from OpenRouter
-        import requests
-        
         headers = {
             "Authorization": f"Bearer {rag_generator.openrouter_api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:3000",
+            "X-Title": "SIGGRAPH RAG Pipeline"
         }
         
         payload = {
-            "model": f"openai/{rag_generator.config.llm_model}",
+            "model": rag_generator.config.llm_model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message}
@@ -271,9 +263,9 @@ IMPORTANT: You have been provided with {len(results)} paper excerpts. Make sure 
         answer_chunks = []
         for line in response.iter_lines():
             if line:
-                line = line.decode('utf-8')
-                if line.startswith('data: '):
-                    data = line[6:]  # Remove 'data: ' prefix
+                line_str = line.decode('utf-8')
+                if line_str.startswith('data: '):
+                    data = line_str[6:]
                     if data == '[DONE]':
                         break
                     try:
@@ -291,7 +283,7 @@ IMPORTANT: You have been provided with {len(results)} paper excerpts. Make sure 
         processing_time = time.time() - start_time
         yield emit("complete", {
             "answer": answer,
-            "sources": list(sources_metadata.values()),
+            "sources": sources_metadata,
             "refined_query": refined if refined != query else None,
             "processing_time": processing_time
         })
@@ -308,8 +300,7 @@ async def stream_query(
     use_reranker: bool = Query(True, description="Use reranker")
 ):
     """
-    Stream query results with real-time progress updates.
-    Returns Server-Sent Events (SSE).
+    Stream query results with real-time progress updates via Server-Sent Events (SSE).
     """
     if not rag_generator:
         raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
@@ -328,17 +319,15 @@ async def stream_query(
 @app.websocket("/ws/query")
 async def websocket_query(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time RAG streaming with detailed progress updates.
+    WebSocket endpoint for real-time RAG streaming.
     """
     await websocket.accept()
     
     try:
-        # Receive query parameters
         data = await websocket.receive_json()
         query = data.get("query", "")
         top_k = data.get("top_k", 8)
         refine_query_flag = data.get("refine_query", True)
-        use_reranker = data.get("use_reranker", True)
         
         if not query:
             await websocket.send_json({"type": "error", "message": "Query is required"})
@@ -353,7 +342,6 @@ async def websocket_query(websocket: WebSocket):
         start_time = time.time()
         loop = asyncio.get_event_loop()
         
-        # Get total chunks count
         total_chunks = len(rag_generator.retrieval.chunks)
         
         # Stage 1: Query Refinement
@@ -379,22 +367,16 @@ async def websocket_query(websocket: WebSocket):
                     "refined": refined
                 })
         
-        # Stage 2: Searching with detailed progress
+        # Stage 2: Searching
         await websocket.send_json({
             "type": "progress",
             "stage": "searching",
-            "message": f"Searching {total_chunks:,} document chunks (semantic + keyword search)..."
+            "message": f"Searching {total_chunks:,} document chunks..."
         })
         
-        # Use the full retrieve method which handles everything properly
         results = await loop.run_in_executor(
             None,
-            lambda: rag_generator.retrieval.retrieve(
-                refined, 
-                top_k=top_k,
-                use_hybrid=True,
-                use_reranker=use_reranker
-            )
+            lambda: rag_generator.retrieval.retrieve(refined, top_k=top_k)
         )
         
         if not results:
@@ -411,18 +393,16 @@ async def websocket_query(websocket: WebSocket):
             "num_papers": num_papers
         })
         
-        # Stage 6: Generating Answer
+        # Stage 3: Generating Answer
         await websocket.send_json({
             "type": "progress",
             "stage": "generating",
-            "message": "Generating answer with GPT-4..."
+            "message": "Generating answer..."
         })
         
-        # Format context and build sources
         context = rag_generator._format_context(results)
         sources_metadata = rag_generator._build_sources_metadata(results)
         
-        # Build prompt
         user_message = f"""Based on the following research paper excerpts, answer this question:
 
 Question: {query}
@@ -436,16 +416,15 @@ IMPORTANT: You have been provided with {len(results)} paper excerpts. Make sure 
 3. For "which paper" or "what papers" questions, list ALL relevant papers
 4. Do NOT include a References section - only use inline citations"""
 
-        # Stream from OpenRouter
-        import requests
-        
         headers = {
             "Authorization": f"Bearer {rag_generator.openrouter_api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:3000",
+            "X-Title": "SIGGRAPH RAG Pipeline"
         }
         
         payload = {
-            "model": f"openai/{rag_generator.config.llm_model}",
+            "model": rag_generator.config.llm_model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message}
@@ -484,12 +463,12 @@ IMPORTANT: You have been provided with {len(results)} paper excerpts. Make sure 
         
         answer = "".join(answer_chunks)
         
-        # Stage 7: Complete
+        # Stage 4: Complete
         processing_time = time.time() - start_time
         await websocket.send_json({
             "type": "complete",
             "answer": answer,
-            "sources": list(sources_metadata.values()),
+            "sources": sources_metadata,
             "refined_query": refined if refined != query else None,
             "processing_time": processing_time
         })
@@ -511,23 +490,21 @@ IMPORTANT: You have been provided with {len(results)} paper excerpts. Make sure 
 if __name__ == "__main__":
     import uvicorn
     
-    # Get port from environment variable (for deployment) or use 8082 for local dev
     port = int(os.getenv("PORT", 8082))
     
     print(f"""
 ╔════════════════════════════════════════════════════════════════╗
-║           SIGGRAPH 2025 RAG API Server                        ║
+║           SIGGRAPH 2025 RAG API Server                         ║
 ╠════════════════════════════════════════════════════════════════╣
 ║                                                                ║
-║  Starting server on http://0.0.0.0:{port}                     ║
+║  Starting server on http://0.0.0.0:{port}                      ║
 ║                                                                ║
 ║  Endpoints:                                                    ║
-║    • GET  /              - Frontend UI                         ║
-║    • GET  /docs          - API Documentation                   ║
+║    • GET  /health        - Health check                        ║
+║    • GET  /docs          - API Documentation (Swagger UI)      ║
 ║    • POST /api/query     - Query endpoint                      ║
-║    • WS  /ws/query       - WebSocket streaming                 ║
-║                                                                ║
-║  Frontend files: ./frontend/                                   ║
+║    • GET  /api/stream    - SSE streaming                       ║
+║    • WS   /ws/query      - WebSocket streaming                 ║
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝
 """)
